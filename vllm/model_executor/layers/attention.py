@@ -73,6 +73,163 @@ class PagedAttention(nn.Module):
                 f"Supported head sizes: {_SUPPORTED_HEAD_SIZES}."
             )
 
+    def _prompt_with_shared_prefix(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        input_metadata: InputMetadata,
+        batch_size: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Hydragen-style prefill using a single shared prefix.
+
+        Returns flattened output of shape [B*Q, H, D].
+        """
+        # Shared prefix length and groups
+        S = int(input_metadata.shared_prefix_len)
+        Bs = int(getattr(input_metadata, "shared_groups", 1) or 1)
+        assert S <= seq_len, f"shared_prefix_len {S} > seq_len {seq_len}"
+        assert batch_size % Bs == 0, (
+            f"Batch {batch_size} must be divisible by shared_groups {Bs}"
+        )
+        groups = batch_size // Bs
+
+        # Reconstruct 4D tensors: q4=[B,Q,H,D], k4/v4=[B,Q,Hkv,D]
+        q_flat = query.reshape(-1, self.num_heads, self.head_size)
+        q4 = q_flat.view(batch_size, seq_len, self.num_heads, self.head_size)
+        if key.dim() == 4:
+            key_kv = key[:, :, 0, :]
+            value_kv = value[:, :, 0, :]
+        else:
+            key_kv = key
+            value_kv = value
+        k4 = key_kv.view(batch_size, seq_len, self.num_kv_heads, self.head_size)
+        v4 = value_kv.view(batch_size, seq_len, self.num_kv_heads, self.head_size)
+
+        # Prepare shared K/V buffers (from cache if available), reused below
+        cached_k = getattr(input_metadata, "shared_prefix_k", None)
+        cached_v = getattr(input_metadata, "shared_prefix_v", None)
+        cached_cu = getattr(input_metadata, "shared_prefix_cu", None)
+        if cached_k is not None and cached_v is not None and cached_cu is not None:
+            shared_k = cached_k.view(Bs, S, self.num_kv_heads, self.head_size)
+            shared_v = cached_v.view(Bs, S, self.num_kv_heads, self.head_size)
+            k_shared = cached_k  # [Bs*S, Hkv, D]
+            v_shared = cached_v
+            cu_k_shared = cached_cu  # [Bs+1]
+        else:
+            shared_k_list: List[torch.Tensor] = []
+            shared_v_list: List[torch.Tensor] = []
+            for g in range(Bs):
+                base_idx = g * groups
+                shared_k_list.append(k4[base_idx, :S])
+                shared_v_list.append(v4[base_idx, :S])
+            shared_k = torch.stack(shared_k_list, dim=0)  # [Bs, S, Hkv, D]
+            shared_v = torch.stack(shared_v_list, dim=0)
+            k_shared = shared_k.reshape(Bs * S, self.num_kv_heads, self.head_size)
+            v_shared = shared_v.reshape(Bs * S, self.num_kv_heads, self.head_size)
+            cu_k_shared = torch.arange(
+                0, (Bs + 1) * S, step=S, dtype=torch.int32, device=q4.device
+            )
+        Lu = seq_len - S
+        # Group queries: [Bs, groups*Q, H, D]
+        q_grouped = q4.view(Bs, groups, seq_len, self.num_heads, self.head_size)
+        q_grouped = q_grouped.reshape(
+            Bs, groups * seq_len, self.num_heads, self.head_size
+        )
+        total_q_shared = Bs * groups * seq_len
+        q_shared = q_grouped.reshape(total_q_shared, self.num_heads, self.head_size)
+        cu_q_shared = torch.arange(
+            0,
+            (Bs + 1) * (groups * seq_len),
+            step=(groups * seq_len),
+            dtype=torch.int32,
+            device=q4.device,
+        )
+
+        fa_ver = (
+            3
+            if is_fa_version_supported(3, q4.device)
+            else (2 if is_fa_version_supported(2, q4.device) else 0)
+        )
+        if not fa_ver:
+            raise ValueError("Not compatible attention function")
+        out_s, lse_s = flash_attn_varlen_func(
+            q_shared,
+            k_shared,
+            v_shared,
+            max_seqlen_q=groups * seq_len,
+            cu_seqlens_q=cu_q_shared,
+            max_seqlen_k=S,
+            cu_seqlens_k=cu_k_shared,
+            dropout_p=0.0,
+            softmax_scale=self.scale,
+            causal=False,
+            alibi_slopes=None,
+            return_softmax_lse=False,
+            fa_version=fa_ver,
+        )
+        out_s = out_s.view(Bs, groups, seq_len, self.num_heads, self.head_size)
+        out_s = out_s.reshape(batch_size, seq_len, self.num_heads, self.head_size)
+
+        # If only the shared part exists, compute shared attention only (non-causal)
+        if Lu == 0:
+            # shared_k, k_shared, v_shared, cu_k_shared prepared above
+            return out_s.reshape(-1, self.num_heads, self.head_size)
+        # Compute two-way combine (shared non-causal, unique causal)
+        total_q = batch_size * seq_len
+        cu_q = torch.arange(
+            0,
+            (batch_size + 1) * seq_len,
+            step=seq_len,
+            dtype=torch.int32,
+            device=q4.device,
+        )
+        q_unique = q4.reshape(total_q, self.num_heads, self.head_size)
+        k_unique = k4[:, S:, :, :].reshape(
+            batch_size * Lu, self.num_kv_heads, self.head_size
+        )
+        v_unique = v4[:, S:, :, :].reshape(
+            batch_size * Lu, self.num_kv_heads, self.head_size
+        )
+        cu_k_unique = torch.arange(
+            0, (batch_size + 1) * Lu, step=Lu, dtype=torch.int32, device=q4.device
+        )
+
+        out_u, lse_u = flash_attn_varlen_func(
+            q_unique,
+            k_unique,
+            v_unique,
+            max_seqlen_q=seq_len,
+            cu_seqlens_q=cu_q,
+            max_seqlen_k=Lu,
+            cu_seqlens_k=cu_k_unique,
+            dropout_p=0.0,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=self.alibi_slopes,
+            return_softmax_lse=True,
+            fa_version=fa_ver,
+        )
+
+        # Reshape unique outputs
+        out_u = out_u.view(batch_size, seq_len, self.num_heads, self.head_size)
+        lse_u = (
+            lse_u.view(self.num_heads, batch_size, seq_len)
+            .permute(1, 2, 0)
+            .contiguous()
+        )
+
+        lse_s = (
+            lse_s.view(self.num_heads, Bs, groups * seq_len)
+            .permute(1, 2, 0)
+            .contiguous()
+        )
+        lse_s = lse_s.view(batch_size, seq_len, self.num_heads)
+
+        output_merged = _combine_lse_two_way(out_s, lse_s, out_u, lse_u)
+        return output_merged.view(-1, self.num_heads, self.head_size)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -161,187 +318,14 @@ class PagedAttention(nn.Module):
                         query.dtype,
                     )
 
-            # Hydragen-style prefill path if shared segments are provided.
+            # Hydragen-style prefill with shared-prefix only (single shared segment).
             if (
-                getattr(input_metadata, "shared_ks", None) is not None
-                and getattr(input_metadata, "shared_vs", None) is not None
-                and len(input_metadata.shared_ks) > 0
-                and len(input_metadata.shared_vs) > 0
+                getattr(input_metadata, "shared_prefix_len", None) is not None
+                and int(input_metadata.shared_prefix_len) > 0
             ):
-                # Only single shared segment supported in v1 for simplicity.
-                shared_k = input_metadata.shared_ks[0]
-                shared_v = input_metadata.shared_vs[0]
-
-                # Validate shapes: Ks, Vs: [Bs, S, num_kv_heads, head_dim]
-                assert shared_k.dim() == 4 and shared_v.dim() == 4, (
-                    f"shared_k/shared_v must be 4D, got {shared_k.shape} / {shared_v.shape}"
+                output = self._prompt_with_shared_prefix(
+                    query, key, value, input_metadata, batch_size, seq_len
                 )
-                assert shared_k.shape == shared_v.shape, (
-                    f"shared_k/shared_v shape mismatch: {shared_k.shape} vs {shared_v.shape}"
-                )
-                Bs, S, kv_heads_s, hd_s = shared_k.shape
-                assert kv_heads_s == self.num_kv_heads and hd_s == self.head_size, (
-                    f"Shared KV heads/hdim mismatch: {(kv_heads_s, hd_s)} vs {(self.num_kv_heads, self.head_size)}"
-                )
-                assert batch_size % Bs == 0, (
-                    f"Batch {batch_size} must be divisible by shared batch {Bs}"
-                )
-                groups = batch_size // Bs
-
-                # Reconstruct Q, K, V for unique path as 4D tensors [B, Q, H, D].
-                # Query may be [B*Q, H] or [B*Q, kvH, qPerKV, D]; reshape to [B*Q, H, D] then to [B, Q, H, D].
-                q_flat = query.reshape(-1, self.num_heads, self.head_size)
-                q4 = q_flat.view(batch_size, seq_len, self.num_heads, self.head_size)
-
-                # Key/Value may have been expanded for MQA/GQA: drop the repeated query-per-kv axis if present.
-                if key.dim() == 4:
-                    key_kv = key[:, :, 0, :]
-                    value_kv = value[:, :, 0, :]
-                else:
-                    key_kv = key
-                    value_kv = value
-                k4 = key_kv.view(batch_size, seq_len, self.num_kv_heads, self.head_size)
-                v4 = value_kv.view(
-                    batch_size, seq_len, self.num_kv_heads, self.head_size
-                )
-
-                # Build varlen inputs for unique segment (per batch sequence of length seq_len).
-                total_q = batch_size * seq_len
-                cu_q = torch.arange(
-                    0,
-                    (batch_size + 1) * seq_len,
-                    step=seq_len,
-                    dtype=torch.int32,
-                    device=q4.device,
-                )
-                q_unique = q4.reshape(total_q, self.num_heads, self.head_size)
-                k_unique = k4.reshape(
-                    batch_size * seq_len, self.num_kv_heads, self.head_size
-                )
-                v_unique = v4.reshape(
-                    batch_size * seq_len, self.num_kv_heads, self.head_size
-                )
-
-                cu_k_unique = cu_q  # same layout (each sequence has length seq_len)
-
-                # Compute unique attention with LSE (causal=True).
-                # Choose FlashAttention version if available; else fall back.
-                fa_ver = (
-                    3
-                    if is_fa_version_supported(3, q4.device)
-                    else (2 if is_fa_version_supported(2, q4.device) else 0)
-                )
-                if fa_ver:
-                    out_u, lse_u = flash_attn_varlen_func(
-                        q_unique,
-                        k_unique,
-                        v_unique,
-                        max_seqlen_q=seq_len,
-                        cu_seqlens_q=cu_q,
-                        max_seqlen_k=seq_len,
-                        cu_seqlens_k=cu_k_unique,
-                        dropout_p=0.0,
-                        softmax_scale=self.scale,
-                        causal=True,
-                        alibi_slopes=self.alibi_slopes,
-                        return_softmax_lse=True,
-                        fa_version=fa_ver,
-                    )
-                else:
-                    # Fallback: compute concatenated attention directly in torch (slow path)
-                    ks_b = shared_k.repeat(batch_size // Bs, 1, 1, 1)
-                    vs_b = shared_v.repeat(batch_size // Bs, 1, 1, 1)
-                    kcat = torch.cat([ks_b, k4], dim=1)
-                    vcat = torch.cat([vs_b, v4], dim=1)
-                    scores = (
-                        self.scale * torch.einsum("bqhd,bkhd->bhqk", q4, kcat).float()
-                    )
-                    mask_shared = torch.zeros(
-                        seq_len, S, device=q4.device, dtype=scores.dtype
-                    )
-                    tri = torch.triu(
-                        torch.ones(
-                            seq_len, seq_len, device=q4.device, dtype=scores.dtype
-                        ),
-                        diagonal=1,
-                    )
-                    mask_unique = tri * torch.finfo(scores.dtype).min
-                    mask = torch.cat([mask_shared, mask_unique], dim=1)
-                    scores = scores + mask.unsqueeze(0).unsqueeze(0)
-                    probs = torch.softmax(scores, dim=-1).to(vcat.dtype)
-                    out_cat = torch.einsum("bhqk,bkhd->bqhd", probs, vcat)
-                    output = out_cat.reshape(
-                        batch_size * seq_len, self.num_heads, self.head_size
-                    )
-                    return output.view(batch_size, seq_len, hidden_size)
-                # Reshape to [B, Q, H, D] and [B, Q, H].
-                out_u = out_u.view(batch_size, seq_len, self.num_heads, self.head_size)
-                # lse_u: (H, total_q) -> [B, Q, H]
-                lse_u = (
-                    lse_u.view(self.num_heads, batch_size, seq_len)
-                    .permute(1, 2, 0)
-                    .contiguous()
-                )
-
-                # Build varlen inputs for shared segment.
-                # q grouped to [Bs, groups*Q, H, D]
-                q_grouped = q4.view(Bs, groups, seq_len, self.num_heads, self.head_size)
-                q_grouped = q_grouped.reshape(
-                    Bs, groups * seq_len, self.num_heads, self.head_size
-                )
-                total_q_shared = Bs * groups * seq_len
-                q_shared = q_grouped.reshape(
-                    total_q_shared, self.num_heads, self.head_size
-                )
-                cu_q_shared = torch.arange(
-                    0,
-                    (Bs + 1) * (groups * seq_len),
-                    step=(groups * seq_len),
-                    dtype=torch.int32,
-                    device=q4.device,
-                )
-
-                # shared_k/v flattened: [Bs*S, kvH, D]
-                k_shared = shared_k.reshape(Bs * S, self.num_kv_heads, self.head_size)
-                v_shared = shared_v.reshape(Bs * S, self.num_kv_heads, self.head_size)
-                cu_k_shared = torch.arange(
-                    0, (Bs + 1) * S, step=S, dtype=torch.int32, device=q4.device
-                )
-
-                if fa_ver:
-                    out_s, lse_s = flash_attn_varlen_func(
-                        q_shared,
-                        k_shared,
-                        v_shared,
-                        max_seqlen_q=groups * seq_len,
-                        cu_seqlens_q=cu_q_shared,
-                        max_seqlen_k=S,
-                        cu_seqlens_k=cu_k_shared,
-                        dropout_p=0.0,
-                        softmax_scale=self.scale,
-                        causal=False,
-                        alibi_slopes=None,
-                        return_softmax_lse=True,
-                        fa_version=fa_ver,
-                    )
-                else:
-                    # handled by earlier fallback return
-                    pass
-                # Reshape to [B, Q, H, D] and [B, Q, H].
-                out_s = out_s.view(Bs, groups, seq_len, self.num_heads, self.head_size)
-                out_s = out_s.reshape(
-                    batch_size, seq_len, self.num_heads, self.head_size
-                )
-                lse_s = (
-                    lse_s.view(self.num_heads, Bs, groups * seq_len)
-                    .permute(1, 2, 0)
-                    .contiguous()
-                )
-                lse_s = lse_s.view(batch_size, seq_len, self.num_heads)
-
-                # Two-way LSE combine per (B, Q, H, D).
-                output_merged = _combine_lse_two_way(out_s, lse_s, out_u, lse_u)
-                output = output_merged.view(-1, self.num_heads, self.head_size)
             else:
                 # TODO(woosuk): Too many view operations. Let's try to reduce them
                 # in the future for code readability.
