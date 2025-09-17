@@ -8,6 +8,8 @@ from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
 
 from vllm._C import ops
 from vllm.utils import get_max_shared_memory_bytes
+from vllm.model_executor.layers.attention import PagedAttention
+from vllm.model_executor.input_metadata import InputMetadata
 
 FLOAT32_BYTES = torch.finfo(torch.float).bits // 8
 # This will change depending on the compute capability.
@@ -90,8 +92,7 @@ def ref_single_query_cached_kv_attention(
             # Create the ALiBi bias used in the paged attention kernel.
             position_ids = torch.arange(context_len, device=query.device).int()
             alibi_bias = (position_ids - context_len + 1).float()
-            alibi_bias = alibi_slopes.view(-1, 1, 1) * alibi_bias.view(
-                1, 1, -1)
+            alibi_bias = alibi_slopes.view(-1, 1, 1) * alibi_bias.view(1, 1, -1)
 
         out = ref_masked_attention(q, keys, values, scale, alibi_bias)
         out = out.view(num_query_heads, head_size)
@@ -125,20 +126,16 @@ def test_paged_attention(
     gpu_id = f"cuda:{device}"
     scale = float(1.0 / (head_size**0.5))
     num_query_heads, num_kv_heads = num_heads
-    query = torch.empty(num_seqs,
-                        num_query_heads,
-                        head_size,
-                        dtype=dtype,
-                        device=gpu_id)
+    query = torch.empty(
+        num_seqs, num_query_heads, head_size, dtype=dtype, device=gpu_id
+    )
     query.uniform_(-scale, scale)
 
     assert num_query_heads % num_kv_heads == 0
     num_queries_per_kv = num_query_heads // num_kv_heads
     alibi_slopes = None
     if use_alibi:
-        alibi_slopes = torch.randn(num_query_heads,
-                                   dtype=torch.float,
-                                   device=gpu_id)
+        alibi_slopes = torch.randn(num_query_heads, dtype=torch.float, device=gpu_id)
 
     context_lens = [random.randint(1, MAX_SEQ_LEN) for _ in range(num_seqs)]
     context_lens[-1] = MAX_SEQ_LEN
@@ -150,16 +147,15 @@ def test_paged_attention(
     block_tables = []
     for _ in range(num_seqs):
         block_table = [
-            random.randint(0, NUM_BLOCKS - 1)
-            for _ in range(max_num_blocks_per_seq)
+            random.randint(0, NUM_BLOCKS - 1) for _ in range(max_num_blocks_per_seq)
         ]
         block_tables.append(block_table)
     block_tables = torch.tensor(block_tables, dtype=torch.int, device=gpu_id)
 
     # Create the KV caches.
-    key_caches, value_caches = kv_cache_factory(NUM_BLOCKS, block_size, 1,
-                                                num_kv_heads, head_size, dtype,
-                                                seed, gpu_id)
+    key_caches, value_caches = kv_cache_factory(
+        NUM_BLOCKS, block_size, 1, num_kv_heads, head_size, dtype, seed, gpu_id
+    )
     key_cache, value_cache = key_caches[0], value_caches[0]
 
     # Call the paged attention kernel.
@@ -179,8 +175,7 @@ def test_paged_attention(
             alibi_slopes,
         )
     elif version == "v2":
-        num_partitions = ((max_context_len + PARTITION_SIZE - 1) //
-                          PARTITION_SIZE)
+        num_partitions = (max_context_len + PARTITION_SIZE - 1) // PARTITION_SIZE
         assert PARTITION_SIZE % block_size == 0
         num_seqs, num_heads, head_size = output.shape
         tmp_output = torch.empty(
@@ -249,8 +244,7 @@ def ref_multi_query_kv_attention(
         seq_len = end_idx - start_idx
 
         # Create attention mask.
-        attn_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=dtype),
-                               diagonal=1)
+        attn_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=dtype), diagonal=1)
         attn_mask = attn_mask * torch.finfo(dtype).min
         attn_mask = attn_mask.to(dtype=dtype, device=query.device)
 
@@ -295,14 +289,15 @@ def test_multi_query_kv_attention(
 
     scale = float(1.0 / (head_size**0.5))
     num_query_heads, num_kv_heads = num_heads
-    qkv = torch.empty(num_tokens,
-                      num_query_heads + 2 * num_kv_heads,
-                      head_size,
-                      dtype=dtype,
-                      device=gpu_id)
+    qkv = torch.empty(
+        num_tokens,
+        num_query_heads + 2 * num_kv_heads,
+        head_size,
+        dtype=dtype,
+        device=gpu_id,
+    )
     qkv.uniform_(-scale, scale)
-    query, key, value = qkv.split(
-        [num_query_heads, num_kv_heads, num_kv_heads], dim=1)
+    query, key, value = qkv.split([num_query_heads, num_kv_heads, num_kv_heads], dim=1)
 
     num_queries_per_kv = num_query_heads // num_kv_heads
     if num_queries_per_kv > 1:
@@ -332,3 +327,81 @@ def test_multi_query_kv_attention(
         dtype,
     )
     assert torch.allclose(output, ref_output, atol=1e-3, rtol=1e-5)
+
+
+@torch.inference_mode()
+def test_hydragen_prefill_two_way_lse() -> None:
+    if not (hasattr(torch.ops, "_vllm_fa2_C") or hasattr(torch.ops, "_vllm_fa3_C")):
+        pytest.skip("FlashAttention bindings unavailable")
+
+    device = "cuda:0"
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    # Small, supported head size and heads
+    B = 2
+    Q = 3
+    H = 2
+    D = 64
+    Ku = Q
+    S = 2
+    Bs = 1  # shared batch
+
+    dtype = torch.bfloat16
+    scale = float(1.0 / (D**0.5))
+
+    # Build q, k, v
+    q = torch.randn(B, Q, H * D, dtype=dtype, device=device)
+    k = torch.randn(B, Ku, H * D, dtype=dtype, device=device)
+    v = torch.randn(B, Ku, H * D, dtype=dtype, device=device)
+
+    # Shared segments (single segment): [Bs, S, H, D]
+    ks = torch.randn(Bs, S, H, D, dtype=dtype, device=device)
+    vs = torch.randn(Bs, S, H, D, dtype=dtype, device=device)
+
+    # Run PagedAttention prefill with shared segments
+    attn = PagedAttention(num_heads=H, head_size=D, scale=scale, num_kv_heads=H)
+    input_md = InputMetadata(
+        is_prompt=True,
+        slot_mapping=torch.empty(0, dtype=torch.int, device=device),
+        max_context_len=None,
+        context_lens=None,
+        block_tables=None,
+        use_cuda_graph=False,
+        shared_ks=[ks],
+        shared_vs=[vs],
+        shared_max_lens=[S],
+    )
+    out = attn(
+        q,
+        k,
+        v,
+        key_cache=None,
+        value_cache=None,
+        input_metadata=input_md,
+    )
+
+    # Reference: attention over concat(shared, unique) with mask
+    q4 = q.view(B, Q, H, D)
+    k4 = k.view(B, Ku, H, D)
+    v4 = v.view(B, Ku, H, D)
+    # Broadcast shared to batch groups; Bs=1 so repeat to B
+    ks_b = ks.repeat(B // Bs, 1, 1, 1)
+    vs_b = vs.repeat(B // Bs, 1, 1, 1)
+    kcat = torch.cat([ks_b, k4], dim=1)  # [B, S+Ku, H, D]
+    vcat = torch.cat([vs_b, v4], dim=1)
+
+    # Compute scores per head
+    # [B, H, Q, S+Ku]
+    scores = scale * torch.einsum("bqhd,bkhd->bhqk", q4, kcat).float()
+    # Build mask: shared fully visible; unique causal lower-triangular
+    mask_shared = torch.zeros(Q, S, device=device, dtype=scores.dtype)
+    tri = torch.triu(torch.ones(Q, Ku, device=device, dtype=scores.dtype), diagonal=1)
+    mask_unique = tri * torch.finfo(scores.dtype).min
+    mask = torch.cat([mask_shared, mask_unique], dim=1)  # [Q, S+Ku]
+    scores = scores + mask.unsqueeze(0).unsqueeze(0)
+    probs = torch.softmax(scores, dim=-1).to(vcat.dtype)
+    ref = torch.einsum("bhqk,bkhd->bqhd", probs, vcat)
+    ref = ref.reshape(B, Q, H * D)
+
+    assert torch.allclose(out, ref, atol=2e-2, rtol=1e-2)
