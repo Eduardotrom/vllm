@@ -30,6 +30,8 @@ class InputMetadata:
         shared_ks: Optional[List[torch.Tensor]] = None,
         shared_vs: Optional[List[torch.Tensor]] = None,
         shared_max_lens: Optional[List[int]] = None,
+        shared_prefix_len: Optional[int] = None,
+        shared_groups: Optional[int] = None,
     ) -> None:
         self.is_prompt = is_prompt
         self.max_context_len = max_context_len
@@ -46,6 +48,8 @@ class InputMetadata:
         self.shared_ks = shared_ks
         self.shared_vs = shared_vs
         self.shared_max_lens = shared_max_lens
+        self.shared_prefix_len = shared_prefix_len
+        self.shared_groups = shared_groups
 
         # Set during the execution of the first attention op.
         # FIXME(woosuk): This is a hack.
@@ -62,5 +66,7 @@ class InputMetadata:
             f"use_cuda_graph={self.use_cuda_graph}, "
             f"shared_ks={'set' if self.shared_ks is not None else 'None'}, "
             f"shared_vs={'set' if self.shared_vs is not None else 'None'}, "
-            f"shared_max_lens={self.shared_max_lens})"
+            f"shared_max_lens={self.shared_max_lens}, "
+            f"shared_prefix_len={self.shared_prefix_len}, "
+            f"shared_groups={self.shared_groups})"
         )

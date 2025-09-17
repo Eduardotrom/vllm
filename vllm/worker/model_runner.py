@@ -9,7 +9,9 @@ from vllm.config import ModelConfig, ParallelConfig, SchedulerConfig
 from vllm.logger import init_logger
 from vllm.model_executor import get_model, InputMetadata, SamplingMetadata
 from vllm.model_executor.parallel_utils.communication_op import (
-    broadcast, broadcast_object_list)
+    broadcast,
+    broadcast_object_list,
+)
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
 from vllm.utils import in_wsl
@@ -24,7 +26,6 @@ _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [8 * i for i in range(1, 33)]
 
 
 class ModelRunner:
-
     def __init__(
         self,
         model_config: ModelConfig,
@@ -39,8 +40,9 @@ class ModelRunner:
 
         # model_config can be None in tests/samplers/test_sampler.py.
         # FIXME(woosuk): This is a hack to make the tests work. Refactor this.
-        self.sliding_window = (model_config.get_sliding_window()
-                               if model_config is not None else None)
+        self.sliding_window = (
+            model_config.get_sliding_window() if model_config is not None else None
+        )
         self.model = None
         self.block_size = None  # Set after initial profiling.
 
@@ -49,7 +51,9 @@ class ModelRunner:
 
         self.max_context_len_to_capture = (
             self.model_config.max_context_len_to_capture
-            if self.model_config is not None else 0)
+            if self.model_config is not None
+            else 0
+        )
         # When using CUDA graph, the input block tables must be padded to
         # max_context_len_to_capture. However, creating the block table in
         # Python can be expensive. To optimize this, we cache the block table
@@ -66,10 +70,12 @@ class ModelRunner:
     def set_block_size(self, block_size: int) -> None:
         self.block_size = block_size
 
-        max_num_blocks = (self.max_context_len_to_capture + block_size -
-                          1) // block_size
+        max_num_blocks = (
+            self.max_context_len_to_capture + block_size - 1
+        ) // block_size
         self.graph_block_tables = np.zeros(
-            (max(_BATCH_SIZES_TO_CAPTURE), max_num_blocks), dtype=np.int32)
+            (max(_BATCH_SIZES_TO_CAPTURE), max_num_blocks), dtype=np.int32
+        )
 
     def _prepare_prompt(
         self,
@@ -125,18 +131,15 @@ class ModelRunner:
                 slot_mapping[-1].append(slot)
 
         max_prompt_len = max(prompt_lens)
-        input_tokens = _make_tensor_with_pad(input_tokens,
-                                             max_prompt_len,
-                                             pad=0,
-                                             dtype=torch.long)
-        input_positions = _make_tensor_with_pad(input_positions,
-                                                max_prompt_len,
-                                                pad=0,
-                                                dtype=torch.long)
-        slot_mapping = _make_tensor_with_pad(slot_mapping,
-                                             max_prompt_len,
-                                             pad=_PAD_SLOT_ID,
-                                             dtype=torch.long)
+        input_tokens = _make_tensor_with_pad(
+            input_tokens, max_prompt_len, pad=0, dtype=torch.long
+        )
+        input_positions = _make_tensor_with_pad(
+            input_positions, max_prompt_len, pad=0, dtype=torch.long
+        )
+        slot_mapping = _make_tensor_with_pad(
+            slot_mapping, max_prompt_len, pad=_PAD_SLOT_ID, dtype=torch.long
+        )
 
         input_metadata = InputMetadata(
             is_prompt=True,
@@ -145,6 +148,11 @@ class ModelRunner:
             context_lens=None,
             block_tables=None,
             use_cuda_graph=False,
+            # Pass through shared prefix if present on metadata
+            shared_prefix_len=getattr(
+                seq_group_metadata_list[0], "shared_prefix_len", None
+            ),
+            shared_groups=getattr(seq_group_metadata_list[0], "shared_groups", None),
         )
         return input_tokens, input_positions, input_metadata, prompt_lens
 
@@ -172,8 +180,11 @@ class ModelRunner:
                 position = seq_len - 1
                 input_positions.append([position])
 
-                context_len = seq_len if self.sliding_window is None else min(
-                    seq_len, self.sliding_window)
+                context_len = (
+                    seq_len
+                    if self.sliding_window is None
+                    else min(seq_len, self.sliding_window)
+                )
                 context_lens.append(context_len)
 
                 block_table = seq_group_metadata.block_tables[seq_id]
@@ -183,8 +194,7 @@ class ModelRunner:
                 slot_mapping.append([slot])
 
                 if self.sliding_window is not None:
-                    sliding_window_blocks = (self.sliding_window //
-                                             self.block_size)
+                    sliding_window_blocks = self.sliding_window // self.block_size
                     block_table = block_table[-sliding_window_blocks:]
                 block_tables.append(block_table)
 
@@ -193,7 +203,8 @@ class ModelRunner:
         use_captured_graph = (
             not self.model_config.enforce_eager
             and batch_size <= _BATCH_SIZES_TO_CAPTURE[-1]
-            and max_context_len <= self.max_context_len_to_capture)
+            and max_context_len <= self.max_context_len_to_capture
+        )
         if use_captured_graph:
             # Pad the input tokens, positions, and slot mapping to match the
             # batch size of the captured graph.
@@ -207,24 +218,16 @@ class ModelRunner:
                 block_tables.append([])
             batch_size = graph_batch_size
 
-        input_tokens = _make_tensor_with_pad(input_tokens,
-                                             max_len=1,
-                                             pad=0,
-                                             dtype=torch.long,
-                                             device="cuda")
-        input_positions = _make_tensor_with_pad(input_positions,
-                                                max_len=1,
-                                                pad=0,
-                                                dtype=torch.long,
-                                                device="cuda")
-        slot_mapping = _make_tensor_with_pad(slot_mapping,
-                                             max_len=1,
-                                             pad=_PAD_SLOT_ID,
-                                             dtype=torch.long,
-                                             device="cuda")
-        context_lens = torch.tensor(context_lens,
-                                    dtype=torch.int,
-                                    device="cuda")
+        input_tokens = _make_tensor_with_pad(
+            input_tokens, max_len=1, pad=0, dtype=torch.long, device="cuda"
+        )
+        input_positions = _make_tensor_with_pad(
+            input_positions, max_len=1, pad=0, dtype=torch.long, device="cuda"
+        )
+        slot_mapping = _make_tensor_with_pad(
+            slot_mapping, max_len=1, pad=_PAD_SLOT_ID, dtype=torch.long, device="cuda"
+        )
+        context_lens = torch.tensor(context_lens, dtype=torch.int, device="cuda")
 
         if use_captured_graph:
             # The shape of graph_block_tables is
@@ -232,7 +235,7 @@ class ModelRunner:
             input_block_tables = self.graph_block_tables[:batch_size]
             for i, block_table in enumerate(block_tables):
                 if block_table:
-                    input_block_tables[i, :len(block_table)] = block_table
+                    input_block_tables[i, : len(block_table)] = block_table
             block_tables = torch.tensor(input_block_tables, device="cuda")
         else:
             block_tables = _make_tensor_with_pad(
@@ -277,34 +280,38 @@ class ModelRunner:
                     # NOTE: prompt token positions do not need sample, skip
                     categorized_sample_indices_start_idx += prompt_len - 1
 
-                categorized_sample_indices[
-                    sampling_params.sampling_type].append(
-                        categorized_sample_indices_start_idx)
+                categorized_sample_indices[sampling_params.sampling_type].append(
+                    categorized_sample_indices_start_idx
+                )
                 categorized_sample_indices_start_idx += 1
 
                 if sampling_params.prompt_logprobs is not None:
                     selected_token_indices.extend(
-                        range(selected_token_start_idx,
-                              selected_token_start_idx + prompt_len - 1))
-                selected_token_indices.append(selected_token_start_idx +
-                                              prompt_len - 1)
+                        range(
+                            selected_token_start_idx,
+                            selected_token_start_idx + prompt_len - 1,
+                        )
+                    )
+                selected_token_indices.append(selected_token_start_idx + prompt_len - 1)
                 selected_token_start_idx += max_prompt_len
             else:
                 num_seqs = len(seq_ids)
                 selected_token_indices.extend(
-                    range(selected_token_start_idx,
-                          selected_token_start_idx + num_seqs))
+                    range(selected_token_start_idx, selected_token_start_idx + num_seqs)
+                )
                 selected_token_start_idx += num_seqs
 
-                categorized_sample_indices[
-                    sampling_params.sampling_type].extend(
-                        range(categorized_sample_indices_start_idx,
-                              categorized_sample_indices_start_idx + num_seqs))
+                categorized_sample_indices[sampling_params.sampling_type].extend(
+                    range(
+                        categorized_sample_indices_start_idx,
+                        categorized_sample_indices_start_idx + num_seqs,
+                    )
+                )
                 categorized_sample_indices_start_idx += num_seqs
 
-        selected_token_indices = _async_h2d(selected_token_indices,
-                                            dtype=torch.long,
-                                            pin_memory=not self.in_wsl)
+        selected_token_indices = _async_h2d(
+            selected_token_indices, dtype=torch.long, pin_memory=not self.in_wsl
+        )
         categorized_sample_indices = {
             t: _async_h2d(seq_ids, dtype=torch.int, pin_memory=not self.in_wsl)
             for t, seq_ids in categorized_sample_indices.items()
@@ -333,14 +340,17 @@ class ModelRunner:
             is_prompt = seq_group_metadata_list[0].is_prompt
             # Prepare input tensors.
             if is_prompt:
-                (input_tokens, input_positions, input_metadata,
-                 prompt_lens) = self._prepare_prompt(seq_group_metadata_list)
+                (input_tokens, input_positions, input_metadata, prompt_lens) = (
+                    self._prepare_prompt(seq_group_metadata_list)
+                )
             else:
-                (input_tokens, input_positions, input_metadata
-                 ) = self._prepare_decode(seq_group_metadata_list)
+                (input_tokens, input_positions, input_metadata) = self._prepare_decode(
+                    seq_group_metadata_list
+                )
                 prompt_lens = []
-            sampling_metadata = self._prepare_sample(seq_group_metadata_list,
-                                                     prompt_lens)
+            sampling_metadata = self._prepare_sample(
+                seq_group_metadata_list, prompt_lens
+            )
 
             def get_size_or_none(x: Optional[torch.Tensor]):
                 return x.size() if x is not None else None
@@ -349,24 +359,15 @@ class ModelRunner:
             # its shape and then broadcast the tensor to avoid high
             # serialization cost.
             py_data = {
-                "input_tokens_size":
-                input_tokens.size(),
-                "input_positions_size":
-                input_positions.size(),
-                "is_prompt":
-                input_metadata.is_prompt,
-                "slot_mapping_size":
-                get_size_or_none(input_metadata.slot_mapping),
-                "max_context_len":
-                input_metadata.max_context_len,
-                "context_lens_size":
-                get_size_or_none(input_metadata.context_lens),
-                "block_tables_size":
-                get_size_or_none(input_metadata.block_tables),
-                "use_cuda_graph":
-                input_metadata.use_cuda_graph,
-                "selected_token_indices_size":
-                sampling_metadata.selected_token_indices.size(),
+                "input_tokens_size": input_tokens.size(),
+                "input_positions_size": input_positions.size(),
+                "is_prompt": input_metadata.is_prompt,
+                "slot_mapping_size": get_size_or_none(input_metadata.slot_mapping),
+                "max_context_len": input_metadata.max_context_len,
+                "context_lens_size": get_size_or_none(input_metadata.context_lens),
+                "block_tables_size": get_size_or_none(input_metadata.block_tables),
+                "use_cuda_graph": input_metadata.use_cuda_graph,
+                "selected_token_indices_size": sampling_metadata.selected_token_indices.size(),
             }
             broadcast_object_list([py_data], src=0)
             # TODO(zhuohan): Combine the broadcasts or set async_op=True.
@@ -383,39 +384,38 @@ class ModelRunner:
             receving_list = [None]
             broadcast_object_list(receving_list, src=0)
             py_data = receving_list[0]
-            input_tokens = torch.empty(*py_data["input_tokens_size"],
-                                       dtype=torch.long,
-                                       device="cuda")
+            input_tokens = torch.empty(
+                *py_data["input_tokens_size"], dtype=torch.long, device="cuda"
+            )
             broadcast(input_tokens, src=0)
-            input_positions = torch.empty(*py_data["input_positions_size"],
-                                          dtype=torch.long,
-                                          device="cuda")
+            input_positions = torch.empty(
+                *py_data["input_positions_size"], dtype=torch.long, device="cuda"
+            )
             broadcast(input_positions, src=0)
             if py_data["slot_mapping_size"] is not None:
-                slot_mapping = torch.empty(*py_data["slot_mapping_size"],
-                                           dtype=torch.long,
-                                           device="cuda")
+                slot_mapping = torch.empty(
+                    *py_data["slot_mapping_size"], dtype=torch.long, device="cuda"
+                )
                 broadcast(slot_mapping, src=0)
             else:
                 slot_mapping = None
             if py_data["context_lens_size"] is not None:
-                context_lens = torch.empty(*py_data["context_lens_size"],
-                                           dtype=torch.int,
-                                           device="cuda")
+                context_lens = torch.empty(
+                    *py_data["context_lens_size"], dtype=torch.int, device="cuda"
+                )
                 broadcast(context_lens, src=0)
             else:
                 context_lens = None
             if py_data["block_tables_size"] is not None:
-                block_tables = torch.empty(*py_data["block_tables_size"],
-                                           dtype=torch.int,
-                                           device="cuda")
+                block_tables = torch.empty(
+                    *py_data["block_tables_size"], dtype=torch.int, device="cuda"
+                )
                 broadcast(block_tables, src=0)
             else:
                 block_tables = None
             selected_token_indices = torch.empty(
-                *py_data["selected_token_indices_size"],
-                dtype=torch.long,
-                device="cuda")
+                *py_data["selected_token_indices_size"], dtype=torch.long, device="cuda"
+            )
             broadcast(selected_token_indices, src=0)
             input_metadata = InputMetadata(
                 is_prompt=py_data["is_prompt"],
@@ -443,7 +443,8 @@ class ModelRunner:
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
     ) -> Optional[SamplerOutput]:
         input_tokens, input_positions, input_metadata, sampling_metadata = (
-            self.prepare_input_tensors(seq_group_metadata_list))
+            self.prepare_input_tensors(seq_group_metadata_list)
+        )
         # Execute the model.
         if input_metadata.use_cuda_graph:
             graph_batch_size = input_tokens.shape[0]
@@ -476,8 +477,9 @@ class ModelRunner:
         # number of tokens equal to max_num_batched_tokens.
         seqs: List[SequenceGroupMetadata] = []
         for group_id in range(max_num_seqs):
-            seq_len = (max_num_batched_tokens // max_num_seqs +
-                       (group_id < max_num_batched_tokens % max_num_seqs))
+            seq_len = max_num_batched_tokens // max_num_seqs + (
+                group_id < max_num_batched_tokens % max_num_seqs
+            )
             seq_data = SequenceData([0] * seq_len)
             seq = SequenceGroupMetadata(
                 request_id=str(group_id),
@@ -498,20 +500,23 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_model(self, kv_caches: List[KVCache]) -> None:
         assert not self.model_config.enforce_eager
-        logger.info("Capturing the model for CUDA graphs. This may lead to "
-                    "unexpected consequences if the model is not static. To "
-                    "run the model in eager mode, set 'enforce_eager=True' or "
-                    "use '--enforce-eager' in the CLI.")
-        logger.info("CUDA graphs can take additional 1~3 GiB memory per GPU. "
-                    "If you are running out of memory, consider decreasing "
-                    "`gpu_memory_utilization` or enforcing eager mode.")
+        logger.info(
+            "Capturing the model for CUDA graphs. This may lead to "
+            "unexpected consequences if the model is not static. To "
+            "run the model in eager mode, set 'enforce_eager=True' or "
+            "use '--enforce-eager' in the CLI."
+        )
+        logger.info(
+            "CUDA graphs can take additional 1~3 GiB memory per GPU. "
+            "If you are running out of memory, consider decreasing "
+            "`gpu_memory_utilization` or enforcing eager mode."
+        )
         start_time = time.perf_counter()
 
         # Prepare dummy inputs. These will be reused for all batch sizes.
         max_batch_size = max(_BATCH_SIZES_TO_CAPTURE)
         input_tokens = torch.zeros(max_batch_size, 1, dtype=torch.long).cuda()
-        input_positions = torch.zeros(max_batch_size, 1,
-                                      dtype=torch.long).cuda()
+        input_positions = torch.zeros(max_batch_size, 1, dtype=torch.long).cuda()
         slot_mapping = torch.empty(max_batch_size, 1, dtype=torch.long).cuda()
         slot_mapping.fill_(_PAD_SLOT_ID)
         context_lens = torch.ones(max_batch_size, dtype=torch.int32).cuda()
@@ -548,7 +553,6 @@ class ModelRunner:
 
 
 class CUDAGraphRunner:
-
     def __init__(self, model: nn.Module):
         self.model = model
         self.graph = None
@@ -611,12 +615,15 @@ class CUDAGraphRunner:
         # Copy the input tensors to the input buffers.
         self.input_buffers["input_ids"].copy_(input_ids, non_blocking=True)
         self.input_buffers["positions"].copy_(positions, non_blocking=True)
-        self.input_buffers["slot_mapping"].copy_(input_metadata.slot_mapping,
-                                                 non_blocking=True)
-        self.input_buffers["context_lens"].copy_(input_metadata.context_lens,
-                                                 non_blocking=True)
-        self.input_buffers["block_tables"].copy_(input_metadata.block_tables,
-                                                 non_blocking=True)
+        self.input_buffers["slot_mapping"].copy_(
+            input_metadata.slot_mapping, non_blocking=True
+        )
+        self.input_buffers["context_lens"].copy_(
+            input_metadata.context_lens, non_blocking=True
+        )
+        self.input_buffers["block_tables"].copy_(
+            input_metadata.block_tables, non_blocking=True
+        )
 
         # Run the graph.
         self.graph.replay()
@@ -642,10 +649,12 @@ def _make_tensor_with_pad(
     pin_memory: bool = False,
 ) -> torch.Tensor:
     padded_x = [_pad_to_max(x_i, max_len, pad) for x_i in x]
-    return torch.tensor(padded_x,
-                        dtype=dtype,
-                        device=device,
-                        pin_memory=pin_memory and str(device) == "cpu")
+    return torch.tensor(
+        padded_x,
+        dtype=dtype,
+        device=device,
+        pin_memory=pin_memory and str(device) == "cpu",
+    )
 
 
 def _get_graph_batch_size(batch_size: int) -> int:
