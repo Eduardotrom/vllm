@@ -329,11 +329,9 @@ def test_multi_query_kv_attention(
     assert torch.allclose(output, ref_output, atol=1e-3, rtol=1e-5)
 
 
+@pytest.mark.parametrize("Bs", [1, 2])
 @torch.inference_mode()
-def test_hydragen_prefill_two_way_lse() -> None:
-    if not (hasattr(torch.ops, "_vllm_fa2_C") or hasattr(torch.ops, "_vllm_fa3_C")):
-        pytest.skip("FlashAttention bindings unavailable")
-
+def test_hydragen_prefill_two_way_lse(Bs: int) -> None:
     device = "cuda:0"
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
@@ -345,21 +343,25 @@ def test_hydragen_prefill_two_way_lse() -> None:
     D = 64
     Ku = Q
     S = 2
-    Bs = 1  # shared batch
+    # shared batch (parametrized): must divide B
+    assert B % Bs == 0
 
     dtype = torch.bfloat16
     scale = float(1.0 / (D**0.5))
-
     # Build q, k, v
     q = torch.randn(B, Q, H * D, dtype=dtype, device=device)
     k = torch.randn(B, Ku, H * D, dtype=dtype, device=device)
     v = torch.randn(B, Ku, H * D, dtype=dtype, device=device)
 
-    # Shared segments (single segment): [Bs, S, H, D]
-    ks = torch.randn(Bs, S, H, D, dtype=dtype, device=device)
-    vs = torch.randn(Bs, S, H, D, dtype=dtype, device=device)
+    # Derive shared prefixes per-group base (prefix-only API)
+    # Shapes below use 4D views for clarity
+    k4_tmp = k.view(B, Ku, H, D)
+    v4_tmp = v.view(B, Ku, H, D)
+    groups = B // Bs
+    shared_ks = [k4_tmp[g * groups, :S].clone() for g in range(Bs)]  # each [S, H, D]
+    shared_vs = [v4_tmp[g * groups, :S].clone() for g in range(Bs)]
 
-    # Run PagedAttention prefill with shared segments
+    # Run PagedAttention prefill with shared prefix only
     attn = PagedAttention(num_heads=H, head_size=D, scale=scale, num_kv_heads=H)
     input_md = InputMetadata(
         is_prompt=True,
@@ -368,10 +370,10 @@ def test_hydragen_prefill_two_way_lse() -> None:
         context_lens=None,
         block_tables=None,
         use_cuda_graph=False,
-        shared_ks=[ks],
-        shared_vs=[vs],
-        shared_max_lens=[S],
     )
+    # Set prefix-only fields
+    input_md.shared_prefix_len = S
+    input_md.shared_groups = Bs
     out = attn(
         q,
         k,
@@ -381,24 +383,29 @@ def test_hydragen_prefill_two_way_lse() -> None:
         input_metadata=input_md,
     )
 
-    # Reference: attention over concat(shared, unique) with mask
+    # Reference: attention over concat(shared, unique-tail) with mask
     q4 = q.view(B, Q, H, D)
     k4 = k.view(B, Ku, H, D)
     v4 = v.view(B, Ku, H, D)
-    # Broadcast shared to batch groups; Bs=1 so repeat to B
-    ks_b = ks.repeat(B // Bs, 1, 1, 1)
-    vs_b = vs.repeat(B // Bs, 1, 1, 1)
-    kcat = torch.cat([ks_b, k4], dim=1)  # [B, S+Ku, H, D]
-    vcat = torch.cat([vs_b, v4], dim=1)
+    # Broadcast per-group base shared to its group members and stack across groups
+    ks_b = torch.cat(
+        [sk.unsqueeze(0).repeat(groups, 1, 1, 1) for sk in shared_ks], dim=0
+    )  # [B, S, H, D]
+    vs_b = torch.cat(
+        [sv.unsqueeze(0).repeat(groups, 1, 1, 1) for sv in shared_vs], dim=0
+    )
+    Lu = Q - S
+    kcat = torch.cat([ks_b, k4[:, S:]], dim=1)  # [B, S+Lu, H, D]
+    vcat = torch.cat([vs_b, v4[:, S:]], dim=1)
 
     # Compute scores per head
     # [B, H, Q, S+Ku]
     scores = scale * torch.einsum("bqhd,bkhd->bhqk", q4, kcat).float()
     # Build mask: shared fully visible; unique causal lower-triangular
     mask_shared = torch.zeros(Q, S, device=device, dtype=scores.dtype)
-    tri = torch.triu(torch.ones(Q, Ku, device=device, dtype=scores.dtype), diagonal=1)
+    tri = torch.triu(torch.ones(Q, Lu, device=device, dtype=scores.dtype), diagonal=1)
     mask_unique = tri * torch.finfo(scores.dtype).min
-    mask = torch.cat([mask_shared, mask_unique], dim=1)  # [Q, S+Ku]
+    mask = torch.cat([mask_shared, mask_unique], dim=1)  # [Q, S+Lu]
     scores = scores + mask.unsqueeze(0).unsqueeze(0)
     probs = torch.softmax(scores, dim=-1).to(vcat.dtype)
     ref = torch.einsum("bhqk,bkhd->bqhd", probs, vcat)
