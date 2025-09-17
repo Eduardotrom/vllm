@@ -1,6 +1,6 @@
 """Multi-head attention."""
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -14,10 +14,6 @@ from vllm._C import ops
 from vllm._C import cache_ops
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.utils import is_hip
-from vllm.vllm_flash_attn.flash_attn_interface import (
-    flash_attn_varlen_func,
-    is_fa_version_supported,
-)
 
 try:
     import triton
@@ -147,27 +143,14 @@ class PagedAttention(nn.Module):
             device=q4.device,
         )
 
-        fa_ver = (
-            3
-            if is_fa_version_supported(3, q4.device)
-            else (2 if is_fa_version_supported(2, q4.device) else 0)
-        )
-        if not fa_ver:
-            raise ValueError("Not compatible attention function")
-        out_s, lse_s = flash_attn_varlen_func(
+        out_s, lse_s = _attn_varlen_torch(
             q_shared,
             k_shared,
             v_shared,
-            max_seqlen_q=groups * seq_len,
-            cu_seqlens_q=cu_q_shared,
-            max_seqlen_k=S,
-            cu_seqlens_k=cu_k_shared,
-            dropout_p=0.0,
-            softmax_scale=self.scale,
+            cu_q_shared,
+            cu_k_shared,
+            self.scale,
             causal=False,
-            alibi_slopes=None,
-            return_softmax_lse=False,
-            fa_version=fa_ver,
         )
         out_s = out_s.view(Bs, groups, seq_len, self.num_heads, self.head_size)
         out_s = out_s.reshape(batch_size, seq_len, self.num_heads, self.head_size)
@@ -196,20 +179,8 @@ class PagedAttention(nn.Module):
             0, (batch_size + 1) * Lu, step=Lu, dtype=torch.int32, device=q4.device
         )
 
-        out_u, lse_u = flash_attn_varlen_func(
-            q_unique,
-            k_unique,
-            v_unique,
-            max_seqlen_q=seq_len,
-            cu_seqlens_q=cu_q,
-            max_seqlen_k=Lu,
-            cu_seqlens_k=cu_k_unique,
-            dropout_p=0.0,
-            softmax_scale=self.scale,
-            causal=True,
-            alibi_slopes=self.alibi_slopes,
-            return_softmax_lse=True,
-            fa_version=fa_ver,
+        out_u, lse_u = _attn_varlen_torch(
+            q_unique, k_unique, v_unique, cu_q, cu_k_unique, self.scale, causal=True
         )
 
         # Reshape unique outputs
@@ -352,16 +323,11 @@ class PagedAttention(nn.Module):
                 output = out.view_as(query)
         else:
             # Decoding run.
-            fa_ver = (
-                3
-                if is_fa_version_supported(3, query.device)
-                else (2 if is_fa_version_supported(2, query.device) else 0)
-            )
+
             use_hydragen_decode = (
                 getattr(input_metadata, "use_hydragen_decode", False)
                 and getattr(input_metadata, "shared_prefix_len", None) is not None
                 and int(input_metadata.shared_prefix_len) > 0
-                and fa_ver
             )
 
             if (
@@ -520,31 +486,18 @@ class PagedAttention(nn.Module):
         cu_q_unique = torch.arange(
             0, batch_size + 1, step=1, dtype=torch.int32, device=device
         )
-
-        # Select FA version
-        fa_ver = (
-            3
-            if is_fa_version_supported(3, device)
-            else (2 if is_fa_version_supported(2, device) else 0)
-        )
         # Fa version availability is validated before this function so
         # at this point we can assume fa_ver is valid
 
         # Run shared (non-causal) attention
-        out_s, lse_s = flash_attn_varlen_func(
+        out_s, lse_s = _attn_varlen_torch(
             q_shared,
             k_shared,
             v_shared,
-            max_seqlen_q=groups * 1,
-            cu_seqlens_q=cu_q_shared,
-            max_seqlen_k=S,
-            cu_seqlens_k=cu_k_shared,
-            dropout_p=0.0,
-            softmax_scale=self.scale,
+            cu_q_shared,
+            cu_k_shared,
+            self.scale,
             causal=False,
-            alibi_slopes=None,
-            return_softmax_lse=True,
-            fa_version=fa_ver,
         )
         out_s = out_s.view(Bs, groups, 1, num_heads, head_size)
         out_s = out_s.reshape(batch_size, 1, num_heads, head_size)
@@ -552,20 +505,15 @@ class PagedAttention(nn.Module):
         lse_s = lse_s.view(batch_size, 1, num_heads)
 
         # Run unique (causal) attention
-        out_u, lse_u = flash_attn_varlen_func(
+
+        out_u, lse_u = _attn_varlen_torch(
             q_unique,
             k_unique,
             v_unique,
-            max_seqlen_q=1,
-            cu_seqlens_q=cu_q_unique,
-            max_seqlen_k=int(context_lens.max().item()),
-            cu_seqlens_k=cu_k_unique,
-            dropout_p=0.0,
-            softmax_scale=self.scale,
+            cu_q_unique,
+            cu_k_unique,
+            self.scale,
             causal=True,
-            alibi_slopes=self.alibi_slopes,
-            return_softmax_lse=True,
-            fa_version=fa_ver,
         )
         out_u = out_u.view(batch_size, 1, num_heads, head_size)
         lse_u = lse_u.view(num_heads, batch_size, 1).permute(1, 2, 0).contiguous()
@@ -689,6 +637,96 @@ def _combine_lse_many(
         # m = max(lse_prev, lse_i) per position/head.
         aggregated_lse = torch.maximum(aggregated_lse.float(), lses[i].float())
     return aggregated
+
+
+def _build_varlen_mask(
+    q_len: int, k_len: int, causal: bool, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    if not causal:
+        return torch.zeros(q_len, k_len, device=device, dtype=dtype)
+    # Lower-triangular (allow attending to current and previous keys)
+    # Mask upper triangle with very negative values.
+    tri = torch.triu(torch.ones(q_len, k_len, device=device, dtype=dtype), diagonal=1)
+    return tri * torch.finfo(dtype).min
+
+
+def _attn_varlen_torch(
+    q: torch.Tensor,  # [total_q, H, D]
+    k: torch.Tensor,  # [total_k, Hkv, D]
+    v: torch.Tensor,  # [total_k, Hkv, D]
+    cu_q: torch.Tensor,  # [B+1] int32
+    cu_k: torch.Tensor,  # [B+1] int32
+    scale: float,
+    causal: bool,
+    alibi_slopes: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Torch fallback for varlen attention computing outputs and per-(head,query) LSE.
+
+    Returns (out, lse):
+      out: [total_q, H, D]
+      lse: [H, total_q]
+
+    Notes:
+      - Computation is in fp32 for stability; output cast back to q.dtype.
+      - ALiBi is currently not applied in this fallback.
+    """
+    assert q.dim() == 3 and k.dim() == 3 and v.dim() == 3
+    device = q.device
+    dtype_out = q.dtype
+    H = q.shape[1]
+    total_q = q.shape[0]
+    out_chunks: List[torch.Tensor] = []
+    lse_chunks: List[torch.Tensor] = []
+
+    num_seqs = int(cu_q.numel() - 1)
+    assert cu_k.numel() - 1 == num_seqs
+    for i in range(num_seqs):
+        q_start = int(cu_q[i].item())
+        q_end = int(cu_q[i + 1].item())
+        k_start = int(cu_k[i].item())
+        k_end = int(cu_k[i + 1].item())
+        Qi = q_end - q_start
+        Ki = k_end - k_start
+        if Qi == 0 or Ki == 0:
+            continue
+        q_i = q[q_start:q_end].to(torch.float32)  # [Qi, H, D]
+        k_i = k[k_start:k_end].to(torch.float32)  # [Ki, Hkv, D]
+        v_i = v[k_start:k_end].to(torch.float32)  # [Ki, Hkv, D]
+
+        # If MQA/GQA (H != Hkv), repeat K/V over queries per kv to match heads
+        Hkv = k_i.shape[1]
+        if Hkv != H:
+            assert H % Hkv == 0
+            repeat = H // Hkv
+            k_i = k_i.repeat_interleave(repeat, dim=1)
+            v_i = v_i.repeat_interleave(repeat, dim=1)
+
+        # scores: [H, Qi, Ki]
+        scores = scale * torch.einsum("qhd,khd->hqk", q_i, k_i)
+
+        # Mask
+        mask = _build_varlen_mask(
+            Qi, Ki, causal=causal, device=device, dtype=scores.dtype
+        )
+        scores = scores + mask
+
+        # LSE per head, query
+        lse_i = torch.logsumexp(scores, dim=-1)  # [H, Qi]
+
+        # Softmax and output
+        probs = torch.softmax(scores, dim=-1)
+        out_i = torch.einsum("hqk,khd->qhd", probs, v_i)  # [Qi, H, D]
+
+        out_chunks.append(out_i.to(dtype_out))
+        lse_chunks.append(lse_i)
+
+    if out_chunks:
+        out = torch.cat(out_chunks, dim=0)
+        lse = torch.cat(lse_chunks, dim=1)
+    else:
+        out = torch.zeros((total_q, H, q.shape[2]), dtype=dtype_out, device=device)
+        lse = torch.empty((H, 0), dtype=torch.float32, device=device)
+    return out, lse
 
 
 if _TRITON_AVAILABLE:

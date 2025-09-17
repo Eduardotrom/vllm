@@ -242,12 +242,17 @@ class SequenceGroup:
         seqs: List[Sequence],
         sampling_params: SamplingParams,
         arrival_time: float,
+        *,
+        shared_prefix_len: Optional[int] = None,
+        shared_groups: Optional[int] = None,
     ) -> None:
         self.request_id = request_id
         self.seqs_dict = {seq.seq_id: seq for seq in seqs}
         self.sampling_params = sampling_params
         self.arrival_time = arrival_time
         self.prompt_logprobs: Optional[PromptLogprobs] = None
+        self.shared_prefix_len = shared_prefix_len
+        self.shared_groups = shared_groups
 
     @property
     def prompt(self) -> str:
