@@ -405,3 +405,42 @@ def test_hydragen_prefill_two_way_lse() -> None:
     ref = ref.reshape(B, Q, H * D)
 
     assert torch.allclose(out, ref, atol=2e-2, rtol=1e-2)
+
+
+@torch.inference_mode()
+def test_triton_lse_combine_matches_torch() -> None:
+    # Compare Triton 2-way LSE combine against a pure PyTorch reference.
+    try:
+        from vllm.model_executor.layers import attention as attention_mod
+    except Exception:
+        pytest.skip("Cannot import attention module")
+
+    if not getattr(attention_mod, "_TRITON_AVAILABLE", False):
+        pytest.skip("Triton unavailable")
+
+    device = "cuda:0"
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    B, Q, H, D = 2, 4, 3, 64
+    dtype = torch.bfloat16
+
+    out_a = torch.randn(B, Q, H, D, dtype=dtype, device=device)
+    out_b = torch.randn(B, Q, H, D, dtype=dtype, device=device)
+    # Keep LSE magnitudes moderate to avoid saturation
+    lse_a = torch.randn(B, Q, H, dtype=torch.float32, device=device) * 2.0
+    lse_b = torch.randn(B, Q, H, dtype=torch.float32, device=device) * 2.0
+
+    triton_out = attention_mod._combine_lse_two_way_triton(out_a, lse_a, out_b, lse_b)
+
+    # Pure PyTorch reference (fp32 accumulations)
+    m = torch.maximum(lse_a, lse_b)
+    adj_a = torch.exp(lse_a - m)
+    adj_b = torch.exp(lse_b - m)
+    denom = (adj_a + adj_b).clamp_min(torch.finfo(adj_a.dtype).tiny)
+    ref = (
+        out_a.float() * adj_a.unsqueeze(-1) + out_b.float() * adj_b.unsqueeze(-1)
+    ) / denom.unsqueeze(-1)
+    ref = ref.to(dtype)
+
+    assert torch.allclose(triton_out, ref, atol=1e-3, rtol=1e-3)

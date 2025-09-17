@@ -19,6 +19,14 @@ from vllm.vllm_flash_attn.flash_attn_interface import (
     is_fa_version_supported,
 )
 
+try:
+    import triton
+    import triton.language as tl
+
+    _TRITON_AVAILABLE = True
+except Exception:
+    _TRITON_AVAILABLE = False
+
 _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
 _PARTITION_SIZE = 512
@@ -419,26 +427,161 @@ def _combine_lse_two_way(
     out_b: torch.Tensor,
     lse_b: torch.Tensor,
 ) -> torch.Tensor:
-    """Two-way LSE combine for tensors shaped [B, Q, H, D] and [B, Q, H].
+    """Combine two attention outputs using log-sum-exp (LSE) statistics.
 
-    Computes: (out_a * exp(lse_a - m) + out_b * exp(lse_b - m)) / (exp(lse_a - m) + exp(lse_b - m)),
-    where m = max(lse_a, lse_b) computed elementwise over [B, Q, H].
+    This merges two segment-wise attention results (e.g., shared and unique
+    segments) into a single output that is equivalent to running attention on
+    the concatenation of the segments, but without re-materializing the full
+    softmax. Numerically stable via the log-sum-exp trick.
+
+    Args:
+        out_a: Attention output for segment A, shape [B, Q, H, D].
+        lse_a: Log-sum-exp of (scaled) attention logits for segment A,
+            shape [B, Q, H].
+        out_b: Attention output for segment B, shape [B, Q, H, D].
+        lse_b: Log-sum-exp of (scaled) attention logits for segment B,
+            shape [B, Q, H].
+
+    Returns:
+        Tensor of shape [B, Q, H, D] with the merged attention output.
+
+    Notes:
+        - Dtypes: Inputs typically bf16; internal math is promoted to fp32.
+        - Stability: Uses m = max(lse_a, lse_b) and rescales to avoid overflow.
+        - Backend: If Triton is available, dispatch to a fused kernel;
+          otherwise falls back to a pure PyTorch implementation.
     """
-    # Promote to fp32 for stability in exponentials and division.
+    if _TRITON_AVAILABLE:
+        try:
+            return _combine_lse_two_way_triton(out_a, lse_a, out_b, lse_b)
+        except Exception:
+            pass
     lse_a_32 = lse_a.float()
     lse_b_32 = lse_b.float()
     m = torch.maximum(lse_a_32, lse_b_32)
     adj_a = torch.exp(lse_a_32 - m)
     adj_b = torch.exp(lse_b_32 - m)
     denom = adj_a + adj_b
-    # Avoid division by zero (degenerate case), should not happen with valid LSEs.
-    denom = torch.maximum(denom, torch.finfo(denom.dtype).tiny)
+    denom = denom.clamp_min(torch.finfo(denom.dtype).tiny)
     out_a_32 = out_a.float()
     out_b_32 = out_b.float()
     combined = (
         out_a_32 * adj_a.unsqueeze(-1) + out_b_32 * adj_b.unsqueeze(-1)
     ) / denom.unsqueeze(-1)
     return combined.to(out_a.dtype)
+
+
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _lse_combine_two_way_kernel(
+        out1_ptr,
+        out2_ptr,
+        lse1_ptr,
+        lse2_ptr,
+        aggregated_ptr,
+        bsh_stride,
+        bsh,
+        hdim,
+        BLOCK_SIZE_BSH: tl.constexpr,
+        BLOCK_SIZE_HDIM: tl.constexpr,
+    ):
+        """Fused two-way LSE combine over a flattened (B * Q * H, D) tile.
+
+        Pointers:
+            out1_ptr, out2_ptr: row-major matrices of shape (BSH, D).
+            lse1_ptr, lse2_ptr: vectors of length BSH with per-row LSE values.
+            aggregated_ptr: output matrix (BSH, D).
+
+        Other args:
+            bsh_stride: row stride (in elements) for the (BSH, D) matrices.
+            bsh: total rows (B * Q * H).
+            hdim: head dimension D.
+
+        The kernel computes, per row r and feature d:
+            m = max(lse1[r], lse2[r])
+            adj1 = exp(lse1[r] - m); adj2 = exp(lse2[r] - m)
+            aggregated[r, d] = (out1[r, d] * adj1 + out2[r, d] * adj2)
+                                / (adj1 + adj2)
+        """
+        bsh_idx = tl.program_id(0)
+        bsh_range = tl.arange(0, BLOCK_SIZE_BSH)
+        hdim_range = tl.arange(0, BLOCK_SIZE_HDIM)
+
+        lse_start = bsh_idx * BLOCK_SIZE_BSH
+        lse_offs = lse_start + bsh_range
+
+        lse1 = tl.load(lse1_ptr + lse_offs, mask=lse_offs < bsh, other=0.0)
+        lse2 = tl.load(lse2_ptr + lse_offs, mask=lse_offs < bsh, other=0.0)
+
+        max_lse = tl.maximum(lse1, lse2)
+        adj1 = tl.exp(lse1 - max_lse)
+        adj2 = tl.exp(lse2 - max_lse)
+        denom = adj1 + adj2
+
+        out_start = bsh_idx * BLOCK_SIZE_BSH * bsh_stride
+        out_offs = out_start + (bsh_range[:, None] * bsh_stride + hdim_range[None, :])
+
+        out1_ptrs = out1_ptr + out_offs
+        out2_ptrs = out2_ptr + out_offs
+        agg_ptrs = aggregated_ptr + out_offs
+
+        for i in range(0, tl.cdiv(hdim, BLOCK_SIZE_HDIM)):
+            mask = out_offs + i * BLOCK_SIZE_HDIM < hdim * bsh
+            o1 = tl.load(out1_ptrs, mask=mask, other=0.0)
+            o2 = tl.load(out2_ptrs, mask=mask, other=0.0)
+            agg = (o1 * adj1[:, None] + o2 * adj2[:, None]) / denom[:, None]
+            tl.store(agg_ptrs, agg, mask=mask)
+            out1_ptrs += BLOCK_SIZE_HDIM
+            out2_ptrs += BLOCK_SIZE_HDIM
+            agg_ptrs += BLOCK_SIZE_HDIM
+
+
+def _combine_lse_two_way_triton(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+) -> torch.Tensor:
+    """Triton-based two-way LSE combine.
+
+    Maps [B, Q, H, D] tensors to a flattened (B*Q*H, D) layout and launches
+    a fused kernel that performs numerically stable merging using the log-sum-
+    exp trick. Accumulations are in fp32; the output dtype matches ``out_a``.
+
+    Args:
+        out_a: [B, Q, H, D]
+        lse_a: [B, Q, H]
+        out_b: [B, Q, H, D]
+        lse_b: [B, Q, H]
+
+    Returns:
+        Aggregated output of shape [B, Q, H, D].
+    """
+    B, Q, H, D = out_a.shape
+    out1_flat = out_a.contiguous().view(B * Q * H, D)
+    out2_flat = out_b.contiguous().view(B * Q * H, D)
+    lse1 = lse_a.contiguous().float().view(B * Q * H)
+    lse2 = lse_b.contiguous().float().view(B * Q * H)
+    aggregated_flat = torch.empty_like(out1_flat)
+
+    BSH = B * Q * H
+    grid = lambda META: (triton.cdiv(BSH, META["BLOCK_SIZE_BSH"]),)
+
+    _lse_combine_two_way_kernel[grid](
+        out1_flat,
+        out2_flat,
+        lse1,
+        lse2,
+        aggregated_flat,
+        out1_flat.stride(0),
+        BSH,
+        D,
+        BLOCK_SIZE_BSH=32,
+        BLOCK_SIZE_HDIM=64,
+        num_warps=2,
+    )
+    return aggregated_flat.view(B, Q, H, D)
 
 
 def _paged_attention(
