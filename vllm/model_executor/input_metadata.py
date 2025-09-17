@@ -32,6 +32,7 @@ class InputMetadata:
         shared_max_lens: Optional[List[int]] = None,
         shared_prefix_len: Optional[int] = None,
         shared_groups: Optional[int] = None,
+        use_hydragen_decode: bool = False,
     ) -> None:
         self.is_prompt = is_prompt
         self.max_context_len = max_context_len
@@ -50,6 +51,7 @@ class InputMetadata:
         self.shared_max_lens = shared_max_lens
         self.shared_prefix_len = shared_prefix_len
         self.shared_groups = shared_groups
+        self.use_hydragen_decode = use_hydragen_decode
 
         # Set during the execution of the first attention op.
         # FIXME(woosuk): This is a hack.
@@ -68,5 +70,6 @@ class InputMetadata:
             f"shared_vs={'set' if self.shared_vs is not None else 'None'}, "
             f"shared_max_lens={self.shared_max_lens}, "
             f"shared_prefix_len={self.shared_prefix_len}, "
-            f"shared_groups={self.shared_groups})"
+            f"shared_groups={self.shared_groups}, "
+            f"use_hydragen_decode={self.use_hydragen_decode})"
         )

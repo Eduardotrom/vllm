@@ -227,7 +227,7 @@ class PagedAttention(nn.Module):
         )
         lse_s = lse_s.view(batch_size, seq_len, self.num_heads)
 
-        output_merged = _combine_lse_two_way(out_s, lse_s, out_u, lse_u)
+        output_merged = _combine_lse_many([out_s, out_u], [lse_s, lse_u])
         return output_merged.view(-1, self.num_heads, self.head_size)
 
     def forward(
@@ -352,7 +352,27 @@ class PagedAttention(nn.Module):
                 output = out.view_as(query)
         else:
             # Decoding run.
-            if key_cache is not None and value_cache is not None:
+            fa_ver = (
+                3
+                if is_fa_version_supported(3, query.device)
+                else (2 if is_fa_version_supported(2, query.device) else 0)
+            )
+            use_hydragen_decode = (
+                getattr(input_metadata, "use_hydragen_decode", False)
+                and getattr(input_metadata, "shared_prefix_len", None) is not None
+                and int(input_metadata.shared_prefix_len) > 0
+                and fa_ver
+            )
+
+            if (
+                use_hydragen_decode
+                and key_cache is not None
+                and value_cache is not None
+            ):
+                output = self._decode_with_shared_prefix(
+                    query, key_cache, value_cache, input_metadata
+                )
+            elif key_cache is not None and value_cache is not None:
                 output = _paged_attention(
                     query,
                     key_cache,
@@ -369,6 +389,190 @@ class PagedAttention(nn.Module):
 
         # Reshape the output tensor.
         return output.view(batch_size, seq_len, hidden_size)
+
+    def _decode_with_shared_prefix(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        input_metadata: InputMetadata,
+    ) -> torch.Tensor:
+        """Hydragen-style decode using FA-varlen over shared prefix and unique past.
+
+        Assumes one query token per sequence (standard decode). Packs K/V from
+        the paged cache into contiguous buffers via gather, runs varlen FA for
+        shared (non-causal) and unique (causal) segments, then LSE-combines.
+
+        Limitations:
+        - Single shared segment derived from the first sequence of each group.
+        - Requires CUDA FlashAttention backend (FA2/FA3) availability.
+        - bf16 recommended; falls back to the dtype of inputs.
+        """
+        device = query.device
+        dtype = query.dtype
+        batch_size, num_heads, head_size = query.shape
+
+        # Determine grouping and shared prefix length
+        Bs = int(getattr(input_metadata, "shared_groups", 1) or 1)
+        assert batch_size % Bs == 0, (
+            f"Batch {batch_size} must be divisible by shared_groups {Bs}"
+        )
+        groups = batch_size // Bs
+        S = int(input_metadata.shared_prefix_len)
+
+        # Build per-sequence context lengths
+        # context_lens: [B]
+        context_lens = input_metadata.context_lens.to(device=device)
+        # Block size from cache layout
+        block_size = int(value_cache.shape[3])
+
+        # Build slot mapping for full unique contexts across the batch
+        # slot_mapping_unique: [sum_i L_i] with slot = block_id * block_size + offset
+        block_tables = input_metadata.block_tables.to(device=device)
+        slots_list = []
+        cu_k_unique = torch.empty(batch_size + 1, dtype=torch.int32, device=device)
+        cu = 0
+        cu_k_unique[0] = 0
+        for i in range(batch_size):
+            L = int(context_lens[i].item())
+            if L < 0:
+                L = 0
+            pos = torch.arange(L, device=device, dtype=torch.int32)
+            block_idx = torch.div(pos, block_size, rounding_mode="floor")
+            num_blocks = int((L + block_size - 1) // block_size)
+            blocks_i = block_tables[i, :num_blocks].to(torch.int32)
+            block_ids = blocks_i.index_select(0, block_idx)
+            offsets = torch.remainder(pos, block_size)
+            slots = block_ids * block_size + offsets
+            slots_list.append(slots)
+            cu += L
+            cu_k_unique[i + 1] = cu
+
+        total_k = int(cu)
+        if total_k == 0:
+            # Degenerate: no history, output zeros
+            return torch.zeros_like(query)
+
+        # Gather unique K/V into contiguous buffers: [total_k, Hkv, D]
+        k_unique = torch.empty(
+            (total_k, self.num_kv_heads, head_size), device=device, dtype=dtype
+        )
+        v_unique = torch.empty_like(k_unique)
+        slot_mapping_unique = torch.cat(slots_list, dim=0).contiguous()
+        # cache ops expects int32 slot mapping
+        cache_ops.gather_cached_kv(
+            k_unique, v_unique, key_cache, value_cache, slot_mapping_unique
+        )
+
+        # Prepare queries for varlen FA
+        q4 = query.view(batch_size, 1, num_heads, head_size)
+
+        # Build shared K/V from the first sequence in each group: [Bs, S, Hkv, D]
+        # Validate S does not exceed context of base sequences
+        for g in range(Bs):
+            base_idx = g * groups
+            # CURSOR: Review this line - Assuming shared prefix length S <= context_lens[base_idx]
+            assert S <= int(context_lens[base_idx].item()), (
+                f"shared_prefix_len {S} exceeds context length of base seq {base_idx}"
+            )
+
+        # Build slot mapping for shared prefixes (concatenate Bs segments)
+        slots_shared_list = []
+        for g in range(Bs):
+            base_idx = g * groups
+            Ls = S
+            pos = torch.arange(Ls, device=device, dtype=torch.int32)
+            block_idx = torch.div(pos, block_size, rounding_mode="floor")
+            num_blocks = int((Ls + block_size - 1) // block_size)
+            blocks_base = block_tables[base_idx, :num_blocks].to(torch.int32)
+            block_ids = blocks_base.index_select(0, block_idx)
+            offsets = torch.remainder(pos, block_size)
+            slots = block_ids * block_size + offsets
+            slots_shared_list.append(slots)
+        slot_mapping_shared = torch.cat(slots_shared_list, dim=0).contiguous()
+
+        k_shared = torch.empty(
+            (Bs * S, self.num_kv_heads, head_size), device=device, dtype=dtype
+        )
+        v_shared = torch.empty_like(k_shared)
+        cache_ops.gather_cached_kv(
+            k_shared, v_shared, key_cache, value_cache, slot_mapping_shared
+        )
+        cu_k_shared = torch.arange(
+            0, (Bs + 1) * S, step=S, dtype=torch.int32, device=device
+        )
+
+        # Group queries for shared segment: [Bs, groups*1, H, D] -> [total_q_shared, H, D]
+        q_grouped = q4.view(Bs, groups, 1, num_heads, head_size)
+        q_grouped = q_grouped.reshape(Bs, groups * 1, num_heads, head_size)
+        total_q_shared = Bs * groups * 1
+        q_shared = q_grouped.reshape(total_q_shared, num_heads, head_size)
+        cu_q_shared = torch.arange(
+            0,
+            (Bs + 1) * (groups * 1),
+            step=(groups * 1),
+            dtype=torch.int32,
+            device=device,
+        )
+
+        # Build unique varlen descriptors
+        q_unique = query.reshape(batch_size, num_heads, head_size)
+        cu_q_unique = torch.arange(
+            0, batch_size + 1, step=1, dtype=torch.int32, device=device
+        )
+
+        # Select FA version
+        fa_ver = (
+            3
+            if is_fa_version_supported(3, device)
+            else (2 if is_fa_version_supported(2, device) else 0)
+        )
+        # Fa version availability is validated before this function so
+        # at this point we can assume fa_ver is valid
+
+        # Run shared (non-causal) attention
+        out_s, lse_s = flash_attn_varlen_func(
+            q_shared,
+            k_shared,
+            v_shared,
+            max_seqlen_q=groups * 1,
+            cu_seqlens_q=cu_q_shared,
+            max_seqlen_k=S,
+            cu_seqlens_k=cu_k_shared,
+            dropout_p=0.0,
+            softmax_scale=self.scale,
+            causal=False,
+            alibi_slopes=None,
+            return_softmax_lse=True,
+            fa_version=fa_ver,
+        )
+        out_s = out_s.view(Bs, groups, 1, num_heads, head_size)
+        out_s = out_s.reshape(batch_size, 1, num_heads, head_size)
+        lse_s = lse_s.view(num_heads, Bs, groups * 1).permute(1, 2, 0).contiguous()
+        lse_s = lse_s.view(batch_size, 1, num_heads)
+
+        # Run unique (causal) attention
+        out_u, lse_u = flash_attn_varlen_func(
+            q_unique,
+            k_unique,
+            v_unique,
+            max_seqlen_q=1,
+            cu_seqlens_q=cu_q_unique,
+            max_seqlen_k=int(context_lens.max().item()),
+            cu_seqlens_k=cu_k_unique,
+            dropout_p=0.0,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=self.alibi_slopes,
+            return_softmax_lse=True,
+            fa_version=fa_ver,
+        )
+        out_u = out_u.view(batch_size, 1, num_heads, head_size)
+        lse_u = lse_u.view(num_heads, batch_size, 1).permute(1, 2, 0).contiguous()
+
+        # Combine and return
+        out = _combine_lse_two_way(out_s, lse_s, out_u, lse_u)
+        return out.view(batch_size, num_heads, head_size)
 
 
 def _make_alibi_bias(
@@ -453,6 +657,38 @@ def _combine_lse_two_way(
         out_a_32 * adj_a.unsqueeze(-1) + out_b_32 * adj_b.unsqueeze(-1)
     ) / denom.unsqueeze(-1)
     return combined.to(out_a.dtype)
+
+
+def _combine_lse_many(
+    outs: List[torch.Tensor],
+    lses: List[torch.Tensor],
+) -> torch.Tensor:
+    """Generalized LSE combine for N segments.
+
+    Args:
+        outs: List of [B, Q, H, D] attention outputs per segment.
+        lses: List of [B, Q, H] LSE tensors per segment.
+
+    Returns:
+        Aggregated output [B, Q, H, D].
+
+    Notes:
+        - For N==1 returns outs[0].
+        - For N>=2 iteratively reduces using the two-way combine helper,
+          which may dispatch to a Triton kernel when available.
+    """
+    assert len(outs) == len(lses) and len(outs) >= 1
+    if len(outs) == 1:
+        return outs[0]
+    aggregated = outs[0]
+    aggregated_lse = lses[0]
+    for i in range(1, len(outs)):
+        aggregated = _combine_lse_two_way(aggregated, aggregated_lse, outs[i], lses[i])
+        # Update the running LSE as max(lse_prev, lse_i) for numerical stability.
+        # This is consistent with the weighting inside two-way combine where
+        # m = max(lse_prev, lse_i) per position/head.
+        aggregated_lse = torch.maximum(aggregated_lse.float(), lses[i].float())
+    return aggregated
 
 
 if _TRITON_AVAILABLE:

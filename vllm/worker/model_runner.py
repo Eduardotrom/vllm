@@ -253,6 +253,16 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
             use_cuda_graph=use_captured_graph,
+            # Pass shared prefix controls for decode path (optional)
+            shared_prefix_len=getattr(
+                seq_group_metadata_list[0], "shared_prefix_len", None
+            ),
+            shared_groups=getattr(seq_group_metadata_list[0], "shared_groups", None),
+            use_hydragen_decode=(
+                getattr(seq_group_metadata_list[0], "shared_prefix_len", None)
+                is not None
+                and int(getattr(seq_group_metadata_list[0], "shared_prefix_len", 0)) > 0
+            ),
         )
         return input_tokens, input_positions, input_metadata
 
@@ -367,6 +377,9 @@ class ModelRunner:
                 "context_lens_size": get_size_or_none(input_metadata.context_lens),
                 "block_tables_size": get_size_or_none(input_metadata.block_tables),
                 "use_cuda_graph": input_metadata.use_cuda_graph,
+                "shared_prefix_len": input_metadata.shared_prefix_len,
+                "shared_groups": input_metadata.shared_groups,
+                "use_hydragen_decode": input_metadata.use_hydragen_decode,
                 "selected_token_indices_size": sampling_metadata.selected_token_indices.size(),
             }
             broadcast_object_list([py_data], src=0)
@@ -424,6 +437,9 @@ class ModelRunner:
                 context_lens=context_lens,
                 block_tables=block_tables,
                 use_cuda_graph=py_data["use_cuda_graph"],
+                shared_prefix_len=py_data.get("shared_prefix_len", None),
+                shared_groups=py_data.get("shared_groups", None),
+                use_hydragen_decode=py_data.get("use_hydragen_decode", False),
             )
             sampling_metadata = SamplingMetadata(
                 seq_groups=None,
