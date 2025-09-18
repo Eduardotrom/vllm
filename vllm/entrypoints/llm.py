@@ -81,6 +81,9 @@ class LLM:
         swap_space: int = 4,
         enforce_eager: bool = False,
         max_context_len_to_capture: int = 8192,
+        # Hydragen shared-prefix defaults (engine-level)
+        default_shared_prefix_len: Optional[int] = None,
+        default_shared_groups: int = 1,
         **kwargs,
     ) -> None:
         if "disable_log_stats" not in kwargs:
@@ -100,6 +103,8 @@ class LLM:
             swap_space=swap_space,
             enforce_eager=enforce_eager,
             max_context_len_to_capture=max_context_len_to_capture,
+            default_shared_prefix_len=default_shared_prefix_len,
+            default_shared_groups=default_shared_groups,
             **kwargs,
         )
         self.llm_engine = LLMEngine.from_engine_args(engine_args)

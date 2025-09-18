@@ -312,6 +312,8 @@ class Scheduler:
                 seq_data=seq_data,
                 sampling_params=seq_group.sampling_params,
                 block_tables=block_tables,
+                shared_prefix_len=getattr(seq_group, "shared_prefix_len", None),
+                shared_groups=getattr(seq_group, "shared_groups", None),
             )
             seq_group_metadata_list.append(seq_group_metadata)
         return seq_group_metadata_list, scheduler_outputs

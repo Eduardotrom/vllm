@@ -153,6 +153,12 @@ class ModelRunner:
                 seq_group_metadata_list[0], "shared_prefix_len", None
             ),
             shared_groups=getattr(seq_group_metadata_list[0], "shared_groups", None),
+            shared_max_lens=(
+                [int(getattr(seq_group_metadata_list[0], "shared_prefix_len", 0))]
+                if getattr(seq_group_metadata_list[0], "shared_prefix_len", None)
+                is not None
+                else None
+            ),
         )
         return input_tokens, input_positions, input_metadata, prompt_lens
 
@@ -262,6 +268,12 @@ class ModelRunner:
                 getattr(seq_group_metadata_list[0], "shared_prefix_len", None)
                 is not None
                 and int(getattr(seq_group_metadata_list[0], "shared_prefix_len", 0)) > 0
+            ),
+            shared_max_lens=(
+                [int(getattr(seq_group_metadata_list[0], "shared_prefix_len", 0))]
+                if getattr(seq_group_metadata_list[0], "shared_prefix_len", None)
+                is not None
+                else None
             ),
         )
         return input_tokens, input_positions, input_metadata

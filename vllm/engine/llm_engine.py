@@ -360,6 +360,14 @@ class LLMEngine:
         seq = Sequence(seq_id, prompt, prompt_token_ids, block_size)
 
         # Create the sequence group.
+        # Apply engine-level defaults if not provided
+        if shared_prefix_len is None:
+            shared_prefix_len = getattr(
+                self.model_config, "default_shared_prefix_len", None
+            )
+        if shared_groups is None:
+            shared_groups = getattr(self.model_config, "default_shared_groups", 1)
+
         seq_group = SequenceGroup(
             request_id,
             [seq],
