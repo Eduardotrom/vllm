@@ -390,9 +390,9 @@ class PagedAttention(nn.Module):
         # context_lens: [B]
         context_lens = input_metadata.context_lens.to(device=device)
         # Block size from cache layout
-        block_size = int(value_cache.shape[3])
-
-        # Build slot mapping for full unique contexts across the batch
+        block_size = int(
+            value_cache.shape[3]
+        )  # Build slot mapping for full unique contexts across the batch
         # slot_mapping_unique: [sum_i L_i] with slot = block_id * block_size + offset
         block_tables = input_metadata.block_tables.to(device=device)
         slots_list = []
@@ -486,9 +486,6 @@ class PagedAttention(nn.Module):
         cu_q_unique = torch.arange(
             0, batch_size + 1, step=1, dtype=torch.int32, device=device
         )
-        # Fa version availability is validated before this function so
-        # at this point we can assume fa_ver is valid
-
         # Run shared (non-causal) attention
         out_s, lse_s = _attn_varlen_torch(
             q_shared,
